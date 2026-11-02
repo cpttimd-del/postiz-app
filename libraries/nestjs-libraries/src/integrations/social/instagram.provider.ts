@@ -474,8 +474,175 @@ export class InstagramProvider
     };
   }
 
+  // Meta "Unified login". Meta apps created since late 2026 are offered only
+  // "Instagram API setup with Unified login": Facebook Login for Business with
+  // a configuration (FACEBOOK_CONFIG_ID) that issues a system-user access
+  // token for the business portfolio's Instagram account, with no Facebook
+  // Page. Such apps refuse the scope-based dialog ("Invalid Scopes") and have
+  // no Instagram app id for the standalone provider. With FACEBOOK_CONFIG_ID
+  // set, the login, the code exchange, the account list and the account
+  // details take this route; unset, nothing changes. Posting is the same
+  // either way: the system-user token publishes through
+  // graph.facebook.com/{ig-user-id}/media like a Page token does.
+  private get unifiedLogin() {
+    return !!process.env.FACEBOOK_CONFIG_ID;
+  }
+
+  // A Graph call whose failure carries Meta's message and code, never the
+  // URL (it holds the token).
+  private async unifiedGraph(url: string) {
+    const response = await fetch(url);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.error) {
+      const e = body.error || {};
+      throw new Error(
+        `Instagram (Unified login): Meta answered ${response.status}${
+          e.code ? ` code ${e.code}` : ''
+        }: ${e.message || 'request failed'}`
+      );
+    }
+    return body;
+  }
+
+  private async unifiedAccount(id: string, accessToken: string) {
+    const account = await this.unifiedGraph(
+      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(
+        id
+      )}?fields=id,username,name,profile_picture_url&access_token=${encodeURIComponent(
+        accessToken
+      )}`
+    );
+    return {
+      id: String(account.id),
+      username: account.username || '',
+      name: account.name || account.username || String(account.id),
+      picture: account.profile_picture_url || '',
+    };
+  }
+
+  // The Instagram accounts the system-user token was granted for: the ones
+  // assigned to it (needs business_management on the configuration), else
+  // the targets of its instagram_* permissions.
+  private async unifiedPages(accessToken: string) {
+    let found: {
+      id: string;
+      username: string;
+      name: string;
+      picture: string;
+    }[] = [];
+    try {
+      const assigned = await this.unifiedGraph(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/assigned_instagram_accounts?fields=id,username,name,profile_picture_url&limit=100&access_token=${encodeURIComponent(
+          accessToken
+        )}`
+      );
+      found = (assigned.data || []).map((a: any) => ({
+        id: String(a.id),
+        username: a.username || '',
+        name: a.name || a.username || String(a.id),
+        picture: a.profile_picture_url || '',
+      }));
+    } catch (err) {
+      // Refused or empty without business_management; the fallback below.
+    }
+    if (!found.length) {
+      const appToken = `${process.env.FACEBOOK_APP_ID}|${process.env.FACEBOOK_APP_SECRET}`;
+      const debug = await this.unifiedGraph(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/debug_token?input_token=${encodeURIComponent(
+          accessToken
+        )}&access_token=${encodeURIComponent(appToken)}`
+      );
+      const ids = new Set<string>();
+      for (const scope of debug.data?.granular_scopes || []) {
+        if (
+          /^instagram_(basic|content_publish|business_basic|business_content_publish)$/.test(
+            scope.scope
+          )
+        ) {
+          for (const id of scope.target_ids || []) {
+            ids.add(String(id));
+          }
+        }
+      }
+      found = await Promise.all(
+        [...ids].map((id) => this.unifiedAccount(id, accessToken))
+      );
+    }
+    if (!found.length) {
+      throw new Error(
+        "Instagram (Unified login): no Instagram account was shared with this app. Add the account to the business portfolio and to the configuration's assets, then connect again."
+      );
+    }
+    return found.map((a) => ({
+      pageId: a.id,
+      id: a.id,
+      name: a.name,
+      picture: { data: { url: a.picture } },
+    }));
+  }
+
+  private async authenticateUnified(params: {
+    code: string;
+    codeVerifier: string;
+    refresh: string;
+  }) {
+    const { access_token } = await this.unifiedGraph(
+      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token` +
+        `?client_id=${encodeURIComponent(process.env.FACEBOOK_APP_ID || '')}` +
+        `&client_secret=${encodeURIComponent(
+          process.env.FACEBOOK_APP_SECRET || ''
+        )}` +
+        `&redirect_uri=${encodeURIComponent(
+          `${process.env.FRONTEND_URL}/integrations/social/instagram${
+            params.refresh ? `?refresh=${params.refresh}` : ''
+          }`
+        )}` +
+        `&code=${encodeURIComponent(params.code)}`
+    );
+    if (!access_token) {
+      throw new Error(
+        'Instagram (Unified login): Meta returned no access token'
+      );
+    }
+    // No long-lived exchange: a system-user token does not expire. And no
+    // /me: a system-user token has no user behind it (/me answers without
+    // an id), so the placeholder id, replaced once the account is picked,
+    // is the first Instagram account the token was granted for.
+    const [first] = await this.unifiedPages(access_token);
+    return {
+      id: first.id,
+      name: first.name,
+      accessToken: access_token,
+      refreshToken: access_token,
+      expiresIn: dayjs().add(10, 'years').unix() - dayjs().unix(),
+      picture: first.picture.data.url,
+      username: '',
+    };
+  }
+
   async generateAuthUrl() {
     const state = makeSecureId(6);
+    if (this.unifiedLogin) {
+      // The dialog and parameters Meta's own dashboard "Login URL" shows for
+      // a configuration: config_id instead of scope, an authorization code
+      // (a system-user configuration issues nothing else), a fresh sign-in.
+      return {
+        url:
+          'https://www.facebook.com/dialog/oauth' +
+          `?client_id=${encodeURIComponent(
+            process.env.FACEBOOK_APP_ID || ''
+          )}` +
+          `&redirect_uri=${encodeURIComponent(
+            `${process.env.FRONTEND_URL}/integrations/social/instagram`
+          )}` +
+          `&state=${state}` +
+          `&config_id=${encodeURIComponent(process.env.FACEBOOK_CONFIG_ID)}` +
+          '&response_type=code&override_default_response_type=true' +
+          '&display=popup&prompt=login',
+        codeVerifier: makeSecureId(10),
+        state,
+      };
+    }
     return {
       url:
         `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth` +
@@ -495,6 +662,9 @@ export class InstagramProvider
     codeVerifier: string;
     refresh: string;
   }) {
+    if (this.unifiedLogin) {
+      return this.authenticateUnified(params);
+    }
     const getAccessToken = await (
       await fetch(
         `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token` +
@@ -550,6 +720,9 @@ export class InstagramProvider
   @DashboardFunction()
   async pages(token: string) {
     const [accessToken, userToken] = token.split('___');
+    if (this.unifiedLogin) {
+      return this.unifiedPages(accessToken);
+    }
     const seenPageIds = new Set<string>();
     const allFacebookPages: any[] = [];
 
@@ -637,6 +810,18 @@ export class InstagramProvider
     data: { pageId: string; id: string }
   ) {
     const [accessToken, userToken] = token.split('___');
+    if (this.unifiedLogin) {
+      // Upstream stores "pageToken___userToken" and posts with the first
+      // half; with Unified login both halves are the system-user token.
+      const account = await this.unifiedAccount(data.id, accessToken);
+      return {
+        id: account.id,
+        name: account.name,
+        picture: account.picture,
+        access_token: `${accessToken}___${accessToken}`,
+        username: account.username,
+      };
+    }
     const { access_token, ...all } = await (
       await fetch(
         `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${data.pageId}?fields=access_token,name,picture.type(large)&access_token=${accessToken}`
